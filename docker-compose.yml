@@ -1,0 +1,141 @@
+name: observability
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.97.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel/otel-collector-config.yaml"]
+    volumes:
+      - ./stubs/observability/otel-collector-config.yaml:/etc/otel/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC in
+      - "4318:4318"   # OTLP HTTP in
+      - "8889:8889"   # Collector metrics
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    profiles: [observability, observ-tracing, observ-metrics, observ-logs]
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./stubs/observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus:/prometheus
+    ports:
+      - "9090:9090"
+    profiles: [observability, observ-metrics]
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    command: -config.file=/etc/loki-config.yaml
+    volumes:
+      - ./stubs/observability/loki-config.yaml:/etc/loki-config.yaml
+      - loki:/loki
+    ports:
+      - "3100:3100"
+    profiles: [observability, observ-logs]
+
+  tempo:
+    image: grafana/tempo:2.4.1
+    container_name: tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./stubs/observability/tempo-config.yaml:/etc/tempo/tempo.yaml
+      - tempo:/var/tempo
+    ports:
+      - "3200:3200"
+    profiles: [observability, observ-tracing]
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./stubs/observability/grafana/provisioning:/etc/grafana/provisioning
+      - grafana:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - otel-collector
+    profiles: [observability, observ-tracing, observ-metrics, observ-logs]
+
+  # -----------------------
+  # A) Health Checker
+  # -----------------------
+  obs-health:
+    image: curlimages/curl:8.8.0
+    container_name: obs-health
+    depends_on:
+      - otel-collector
+      - prometheus
+      - loki
+      - tempo
+      - grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        echo "▶ waiting for services to be ready..."
+        for i in $(seq 1 60); do
+          OC=0; curl -sf http://otel-collector:8889/metrics >/dev/null || OC=1
+          PR=0; curl -sf http://prometheus:9090/-/ready >/dev/null || PR=1
+          TP=0; curl -sf http://tempo:3200/ready >/dev/null || TP=1
+          LK=0; curl -sf http://loki:3100/loki/api/v1/labels >/dev/null || LK=1
+          GF=0; curl -sf -u "$$GF_SECURITY_ADMIN_USER:$$GF_SECURITY_ADMIN_PASSWORD" http://grafana:3000/api/health >/dev/null || GF=1
+          if [ "$$OC$$PR$$TP$$LK$$GF" = "00000" ]; then break; fi
+          sleep 1
+        done
+        echo
+        [ $$OC -eq 0 ] && echo "✔ Collector /metrics OK" || { echo "✘ Collector /metrics FAIL"; exit 1; }
+        [ $$PR -eq 0 ] && echo "✔ Prometheus ready OK"   || { echo "✘ Prometheus ready FAIL"; exit 1; }
+        [ $$TP -eq 0 ] && echo "✔ Tempo ready OK"        || { echo "✘ Tempo ready FAIL"; exit 1; }
+        [ $$LK -eq 0 ] && echo "✔ Loki API OK"           || { echo "✘ Loki API FAIL"; exit 1; }
+        [ $$GF -eq 0 ] && echo "✔ Grafana API OK"        || { echo "✘ Grafana API FAIL"; exit 1; }
+        echo "✅ Observability stack OK"
+    profiles: [observability]
+
+  # ---------------------------
+  # B) OTLP Traffic Generators
+  # ---------------------------
+  obs-gen-traces:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+    container_name: obs-gen-traces
+    depends_on: [otel-collector]
+    command: ["traces", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure", "--duration=10s"]
+    profiles: [observability]
+
+  obs-gen-metrics:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+    container_name: obs-gen-metrics
+    depends_on: [otel-collector]
+    command: ["metrics", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure", "--duration=10s"]
+    profiles: [observability]
+
+  obs-gen-logs:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest
+    container_name: obs-gen-logs
+    depends_on: [otel-collector]
+    command: ["logs", "--otlp-endpoint", "otel-collector:4317", "--otlp-insecure", "--duration=10s"]
+    profiles: [observability]
+
+volumes:
+  grafana: {}
+  loki: {}
+  tempo: {}
+  prometheus: {}
+
+networks:
+  default:
+    name: observability_net

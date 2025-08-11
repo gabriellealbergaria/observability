@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: spring-observability-demo2
+
+server:
+  port: 8081
+
+logging:
+  level:
+    root: INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
